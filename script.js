@@ -1253,6 +1253,18 @@ function connectStreamerbot(){
     client.on('Twitch.ReSub',   onSub('Twitch.ReSub'));
     client.on('Twitch.GiftSub', onSub('Twitch.GiftSub'));
   }
+
+  // Empty the tip jar at the start of each stream. Streamer.bot fires StreamOnline
+  // when you go live; setBitCount(0) clears the saved gems silently (no animation —
+  // the jar just stays blank until the first cheer). The jar still persists across
+  // reloads DURING a stream, so a scene switch or accidental refresh won't wipe it.
+  // Disable with ?resetEachStream=false.
+  if(boolParam('resetEachStream', true)){
+    client.on('Twitch.StreamOnline', () => {
+      console.log('[stinger] Twitch.StreamOnline — emptying the tip jar for the new stream');
+      setBitCount(0);
+    });
+  }
 }
 connectStreamerbot();
 
