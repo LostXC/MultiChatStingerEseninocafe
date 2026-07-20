@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Eseninocafe — Multichat Stingers</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="jarCv"></canvas>
+  <canvas id="stingerCv"></canvas>
+</div>
+
+<div id="hud" hidden>
+  <button class="btn" id="throw1Btn">Throw bit</button>
+  <button class="btn" id="throw10Btn">Throw 10</button>
+  <span class="group">
+    <input class="num" id="cheerAmt" type="number" value="1234" min="1" step="1">
+    <button class="btn" id="cheerBtn">Cheer</button>
+  </span>
+  <button class="btn" id="subBtn">Sub stinger</button>
+  <button class="btn" id="donoBtn">Donation stinger</button>
+  <button class="btn" id="replayBtn">Replay intro</button>
+  <button class="btn" id="demoBtn">Demo fill</button>
+  <button class="btn" id="resetBtn">Reset bits</button>
+  <label class="chk"><input type="checkbox" id="debugChk"> jar walls</label>
+  <label class="chk"><input type="checkbox" id="gemDebugChk"> gem bounds</label>
+  <label class="chk"><input type="checkbox" id="arcDebugChk"> throw arcs</label>
+  <span class="tag" id="bitCount">bits: 0</span>
+</div>
+
+<div id="loading">loading assets…</div>
+
+<script src="assets/vendor/matter.min.js"></script>
+<script src="assets/collision.js"></script>
+<script type="text/javascript" src="https://unpkg.com/@streamerbot/client/dist/streamerbot-client.js"></script>
+<script src="script.js"></script>
+</body>
+</html>
