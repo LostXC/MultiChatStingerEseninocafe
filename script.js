@@ -223,6 +223,37 @@ async function loadAssets(){
   }
 }
 
+/* ---------------- pre-rasterized frames ----------------
+   OBS's browser source (CEF) re-rasterizes an <svg> image on every drawImage —
+   the jar redraws its fill + stroke (twice) full-canvas plus every gem each frame,
+   so that vector work is what makes it lag/glitch in OBS even though it's smooth in
+   a real browser. Bake every frame/sprite to an offscreen raster canvas once, at the
+   size it's actually drawn, so the per-frame draws become cheap bitmap blits. */
+let fillBaked = [], strokeBaked = [], subBaked = [], donoBaked = [];
+const gemBaked = new Map();    // source img -> baked canvas
+const noteBaked = new Map();
+function bakeToCanvas(img, w, h){
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(w));
+  c.height = Math.max(1, Math.round(h));
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  return c;
+}
+function bakeAssets(){
+  fillBaked   = fillImgs.map(im => bakeToCanvas(im, W, H));   // full-canvas: exact 1:1 blits
+  strokeBaked = strokeImgs.map(im => bakeToCanvas(im, W, H));
+  subBaked    = subImgs.map(im => bakeToCanvas(im, im.width, im.height));
+  donoBaked   = donoImgs.map(im => bakeToCanvas(im, im.width, im.height));
+  // gems: bake at the largest on-screen size (a bit's spawn size in flight) so both
+  // the smaller settled gems and the larger flying ones stay crisp when scaled.
+  const gemPx = Math.ceil(Math.max(GEM, THROW.sizeCenter * MAP.s));
+  for(const im of gemImgs){
+    const s = gemPx / Math.max(im.width, im.height);
+    gemBaked.set(im, bakeToCanvas(im, im.width * s, im.height * s));
+  }
+  for(const im of noteImgs) noteBaked.set(im, bakeToCanvas(im, im.width, im.height));
+}
+
 /* =========================================================================
    Collision / jar animation helpers (backBox smoothing, wall pairs,
    rigid jar transform for the settled-gem intro trick)
@@ -355,6 +386,7 @@ let debug=false, gemDebug=false, arcDebug=false;
 let playhead=0, playing=true, lastT=null, firstWallFrame=0, introHidden=true;
 let jarState = 'IDLE'; // IDLE, INTRO, PLAYING, OUTRO
 let outroT = 0;
+let lastWallKey = null; // skips rebuilding the static physics walls every frame once settled
 let idleTime = 0;
 const LAST = ()=>fillImgs.length-1;
 
@@ -443,6 +475,7 @@ function boot(overridePrefillN = null){
   playhead=0; playing=true; introHidden=true; lastT=null;
   jarState = 'INTRO';
   idleTime = 0;
+  lastWallKey = null;   // force a wall rebuild for the new run
 }
 
 function captureAndFreeze(list){
@@ -694,7 +727,7 @@ function drawNotes(ctx, now){
     ctx.save();
     ctx.globalAlpha *= alpha;
     ctx.translate(p[0], p[1]); ctx.rotate(rot); ctx.scale(scale, scale);
-    ctx.drawImage(n.im, -n.im.width/2, -n.im.height/2);
+    ctx.drawImage(noteBaked.get(n.im) || n.im, -n.im.width/2, -n.im.height/2);
     ctx.restore();
   }
 }
@@ -820,10 +853,11 @@ function cheer(bits){
 
 function drawGem(ctx, g){
   const { im, scale } = g.plugin;
+  const src = gemBaked.get(im) || im;   // baked raster (falls back to the svg pre-bake)
   ctx.save();
   if(g.plugin.alpha !== undefined) ctx.globalAlpha *= g.plugin.alpha;
   ctx.translate(g.position.x, g.position.y); ctx.rotate(g.angle);
-  ctx.drawImage(im, -im.width*scale/2, -im.height*scale/2, im.width*scale, im.height*scale);
+  ctx.drawImage(src, -im.width*scale/2, -im.height*scale/2, im.width*scale, im.height*scale);
   ctx.restore();
 }
 function drawFlight(ctx, fl, now){
@@ -831,8 +865,9 @@ function drawFlight(ctx, fl, now){
   const p = cubic(fl, t);
   const size = lerp(fl.size0, GEM, smooth(Math.min(1, t/THROW.shrinkEnd)));
   const scale = size/Math.max(fl.im.width, fl.im.height);
+  const src = gemBaked.get(fl.im) || fl.im;
   ctx.save(); ctx.translate(p[0], p[1]); ctx.rotate(fl.angle0 + fl.spin*t);
-  ctx.drawImage(fl.im, -fl.im.width*scale/2, -fl.im.height*scale/2,
+  ctx.drawImage(src, -fl.im.width*scale/2, -fl.im.height*scale/2,
                 fl.im.width*scale, fl.im.height*scale);
   ctx.restore();
 }
@@ -883,7 +918,16 @@ function loop(ts){
     }
   }
 
-  positionWalls(pairsAt(playing ? playhead : LAST()));
+  // While the jar is moving (intro) the walls track it every frame; once it's
+  // settled into PLAYING the pose is constant, so rebuild them once and then skip
+  // — Body.setVertices on every wall each frame was pure waste during throwing.
+  if(playing){
+    positionWalls(pairsAt(playhead));
+    lastWallKey = null;
+  } else if(lastWallKey !== 'settled'){
+    positionWalls(pairsAt(LAST()));
+    lastWallKey = 'settled';
+  }
 
   if(playing && !introHidden){
     const T = jarTransformBetween(LAST(), playhead);
@@ -934,7 +978,7 @@ function loop(ts){
   } else {
     alpha = playing && playhead <= 3 ? playhead/3 : 1;
   }
-  const fillImg = fillImgs[fi], strokeImg = strokeImgs[fi];
+  const fillImg = fillBaked[fi] || fillImgs[fi], strokeImg = strokeBaked[fi] || strokeImgs[fi];
 
   ctx.globalAlpha = alpha;
   ctx.drawImage(fillImg, 0, 0, W, H);
@@ -1010,6 +1054,12 @@ function playFrames(imgs, type){
   cv.style.display = 'block';
   const ctx = cv.getContext('2d');
   const t0 = performance.now();
+  // safety net: if this play ever gets interrupted (OBS pausing/hiding the source
+  // mid-sequence) so the rAF loop below never reaches isFinished, don't let
+  // stingerBusy stay stuck true forever — that would silently block every future
+  // sub stinger. Clear it well after the sequence should have finished.
+  const maxMs = imgs.length / CFG.fps * 1000 + CFG.waitBeforeFadeMs + CFG.fadeOutMs + 2000;
+  const busyGuard = setTimeout(() => { stingerBusy = false; }, maxMs);
   (function step(now){
     const elapsed = now - t0;
     const totalDuration = imgs.length / CFG.fps * 1000;
@@ -1044,6 +1094,7 @@ function playFrames(imgs, type){
     if (isFinished) {
       cv.style.display = 'none';
       stingerBusy = false;
+      clearTimeout(busyGuard);
       return;
     }
     
@@ -1054,13 +1105,13 @@ function playFrames(imgs, type){
     requestAnimationFrame(step);
   })(t0);
 }
-function playSub(){ playFrames(subImgs, 'sub'); }
+function playSub(){ playFrames(subBaked.length ? subBaked : subImgs, 'sub'); }
 function playDonation(){
   if(!donoImgs.length){
     console.warn('[stinger] donation-stinger frames not found — add assets/donation-stinger/donation-stinger.00.svg …');
     return;
   }
-  playFrames(donoImgs, 'dono');
+  playFrames(donoBaked.length ? donoBaked : donoImgs, 'dono');
 }
 
 /* =========================================================================
@@ -1089,21 +1140,60 @@ window.stinger = {
    with zero cross-source messaging.
 
    Timeline for a triggering event (t = 0 at event receipt), all values shared:
-     0 .............. chat starts fading out (overlay)         [chatFadeMs]
+     0 .............. chat starts fading out (overlay)          [chatFadeMs]
      chatFadeMs ..... chat fully hidden; stinger fades in + plays
-     +stingerFadeMs . stinger fully on screen; content plays   [contentMs]
-     +contentMs ..... stinger fades out                        [stingerFadeMs]
-     => stinger gone exactly as the chat starts fading back in; then the
-        overlay renders the alert card it was holding.
+     chatFadeMs+contentMs ...... stinger fades out              [stingerFadeMs]
+                                 chat starts fading back in     [chatFadeMs]
+     => stinger leaves as the chat returns; then the overlay renders its card.
 
-   IMPORTANT: STINGER_SYNC must stay identical to the copy in the overlay's
-   script.js (search "STINGER_SYNC"). If you change these numbers, change both.
+   contentMs is NOT fixed — it's computed per event by stingerContentMs() so the
+   chat stays hidden exactly as long as the stinger actually needs: a sub is its
+   frame-sequence length; a cheer depends on how many gems get thrown (which the
+   bit amount decides). Both projects compute it from the same event data, so
+   they agree without talking to each other.
+
+   IMPORTANT: STINGER_SYNC and stingerContentMs/stingerCheerThrows must stay
+   identical to the copies in the overlay's script.js (search "STINGER_SYNC").
+   If you change these, change both.
    ========================================================================= */
 const STINGER_SYNC = {
   chatFadeMs:    350,   // overlay chat fade out / in (this source only waits it out)
   stingerFadeMs: 300,   // this source's own fade in and fade out (see #stage transition in style.css)
-  contentMs:     3000,  // how long the stinger stays fully on screen (>= sub frame sequence)
+  // --- tip-jar timing model (mirrors CFG in this file) so the cheer window can be
+  //     predicted from the bit amount. Keep in step with CFG if you retune it. ---
+  fps:            25,   // CFG.fps
+  jarIntroFrames: 36,   // collision.frames.length — the jar-rise intro
+  throwStaggerMs: 170,  // CFG.throwStaggerMs — gap between queued throws
+  throwFlightMs:  780,  // CFG.throwDurationMs — a gem's flight time
+  maxThrows:      40,   // CFG.maxQueuedThrows — the jar clamps a cheer to this many
+  cheerTailMs:    900,  // settle + hold the full jar after the last gem, before fading
+  subFrames:      65,   // sub-stinger frame count (subImgs.length)
+  subHoldMs:      550,  // hold the last sub frame before fading
+  bufferMs:       300,  // safety pad so the chat never fades in before the stinger is done
 };
+
+// How many gems a cheer throws — mirrors CFG.bitTiers decomposition (biggest tier
+// first, one gem per full tier amount, remainder flows down), clamped like the jar.
+function stingerCheerThrows(bits){
+  const mins = [10000, 5000, 1000, 100, 10];
+  let rest = Math.max(0, Math.floor(bits) || 0), n = 0;
+  for(const m of mins){ const c = Math.floor(rest / m); if(c > 0){ rest -= c * m; n += c; } }
+  if(n === 0) n = 1;                       // any nonzero cheer throws at least one gray
+  return Math.min(n, STINGER_SYNC.maxThrows);
+}
+
+// On-screen time (ms) the stinger needs for an event. Shared by BOTH projects.
+function stingerContentMs(kind, data){
+  const S = STINGER_SYNC;
+  if(kind === 'cheer'){
+    const n = stingerCheerThrows(data && data.bits);
+    const introMs  = S.jarIntroFrames / S.fps * 1000;        // jar rises
+    const throwsMs = (n - 1) * S.throwStaggerMs + S.throwFlightMs; // launch all + last flight
+    return Math.round(introMs + throwsMs + S.cheerTailMs + S.bufferMs);
+  }
+  // sub / resub / gift / bomb — fixed frame sequence
+  return Math.round(S.subFrames / S.fps * 1000 + S.subHoldMs + S.bufferMs);
+}
 
 const stageEl = $('stage');
 let   stagePending = [];   // effects waiting for the current cycle's fade-in moment
@@ -1111,27 +1201,27 @@ let   stageFadeInAt = 0;   // performance.now() timestamp of this cycle's fade-i
 let   stageCycleEndAt = 0; // performance.now() timestamp the stage is fully hidden again
 function stageFade(op){ if(stageEl) stageEl.style.opacity = String(op); }
 
-function startStageCycle(){
+function startStageCycle(contentMs){
   const S = STINGER_SYNC, now = performance.now();
   stageFadeInAt   = now + S.chatFadeMs;
-  stageCycleEndAt = now + S.chatFadeMs + S.stingerFadeMs*2 + S.contentMs;
+  stageCycleEndAt = now + S.chatFadeMs + contentMs + S.stingerFadeMs;
   stageFade(0);                                             // hide (canvas is blank here anyway)
   setTimeout(()=>{                                          // chat is gone -> fade in + fire queued effects
     stageFade(1);
     const items = stagePending; stagePending = [];
     items.forEach(e => e.effect());
   }, S.chatFadeMs);
-  setTimeout(()=> stageFade(0), S.chatFadeMs + S.stingerFadeMs + S.contentMs);  // fade out
+  setTimeout(()=> stageFade(0), S.chatFadeMs + contentMs);  // fade out as content ends
   // once fully hidden (and no fresh cycle superseded us) restore to visible so the
   // blank idle stage and any manual HUD trigger show again
   setTimeout(()=>{ if(performance.now() >= stageCycleEndAt) stageFade(1); },
-             S.chatFadeMs + S.stingerFadeMs*2 + S.contentMs + 300);
+             S.chatFadeMs + contentMs + S.stingerFadeMs + 400);
 }
 
 // Route a Streamer.bot event through the sync envelope. kind is 'cheer' or 'sub'.
-function triggerStinger(kind, effect){
+function triggerStinger(kind, data, effect){
   const now = performance.now();
-  if(now >= stageCycleEndAt) startStageCycle();             // no cycle running -> start one
+  if(now >= stageCycleEndAt) startStageCycle(stingerContentMs(kind, data)); // no cycle -> start one
   if(now < stageFadeInAt){
     // still before this cycle's fade-in: queue the effect to fire then. Collapse a
     // burst of gift-subs (a sub bomb) into a single sub stinger.
@@ -1185,17 +1275,23 @@ function connectStreamerbot(){
   if(showCheers){
     client.on('Twitch.Cheer', ({ data }) => {
       const bits = Number(data?.bits ?? data?.message?.bits ?? 0);
-      if(bits > 0) triggerStinger('cheer', () => stinger.cheer(bits));
+      console.log('[stinger] Twitch.Cheer received — bits:', bits,
+                  '→ window', stingerContentMs('cheer', { bits }) + 'ms');
+      if(bits > 0) triggerStinger('cheer', { bits }, () => stinger.cheer(bits));
     });
   }
 
   // Sub / Resub / Gift sub -> full-screen sub stinger (donation stinger untouched).
   // A gift-sub bomb fires many GiftSub events; triggerStinger collapses them into one.
   if(showSubs){
-    const onSub = () => triggerStinger('sub', () => stinger.playSub());
-    client.on('Twitch.Sub', onSub);
-    client.on('Twitch.ReSub', onSub);
-    client.on('Twitch.GiftSub', onSub);
+    const onSub = (name) => (evt) => {
+      console.log('[stinger] ' + name + ' received → sub stinger, window',
+                  stingerContentMs('sub') + 'ms');
+      triggerStinger('sub', evt && evt.data, () => stinger.playSub());
+    };
+    client.on('Twitch.Sub',     onSub('Twitch.Sub'));
+    client.on('Twitch.ReSub',   onSub('Twitch.ReSub'));
+    client.on('Twitch.GiftSub', onSub('Twitch.GiftSub'));
   }
 }
 connectStreamerbot();
@@ -1237,6 +1333,7 @@ function wireHud(){
   }
   $('loading').hidden = true;
 
+  bakeAssets();          // pre-rasterize every SVG frame/sprite so OBS isn't re-rasterizing them each frame
   buildSmoothedBoxes();
   if (params.has('bits')) {
     setBitCount(parseInt(params.get('bits'),10) || 0);

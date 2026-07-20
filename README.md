@@ -132,20 +132,33 @@ timeline.** Since both receive an event at the same instant, they stay in lockst
 On a sub/cheer: chat fades out → stinger fades in and plays → stinger fades out
 exactly as the chat fades back in → the chat renders its alert card.
 
-The shared timing lives in a `STINGER_SYNC` constant that is **duplicated in both
-projects' `script.js` and must be kept identical** (the `#stage` opacity transition
-here and the `#mainContainer` transition in the overlay must match the fade values):
+The shared timing lives in a `STINGER_SYNC` constant plus a `stingerContentMs()`
+calculator, both **duplicated in both projects' `script.js` and kept logically
+identical** (the `#stage` opacity transition here and the `#mainContainer`
+transition in the overlay must match the fade values).
 
-```js
-const STINGER_SYNC = { chatFadeMs: 350, stingerFadeMs: 300, contentMs: 3000 };
-```
+The on-screen time is **not fixed** — `stingerContentMs(kind, data)` computes how
+long the stinger actually needs for each event, so the chat stays hidden exactly
+that long and nothing gets cut off:
 
-`contentMs` is how long the stinger stays fully on screen — it's the same for every
-event (a huge cheer and a tiny one reserve the same time), so the two sources never
-have to predict a variable duration. Bump it in **both** files if you want longer.
+- **sub / resub / gift / bomb** → the frame-sequence length (`subFrames/fps` + a hold).
+- **cheer** → depends on the bit amount: it mirrors the jar's own tier decomposition
+  to get the number of gems thrown, then `intro + throws×stagger + last flight +
+  settle`. A 100-bit cheer (1 gem) reserves ~3.4s; a 1234-bit cheer (6 gems) ~4.3s;
+  a 9999-bit cheer (23 gems) ~7.2s. Both projects run the same formula on the same
+  event, so they agree without talking to each other.
+
+If you retune the jar (`CFG.throwStaggerMs`, `throwDurationMs`, `waitBeforeFadeMs`,
+the frame count, `bitTiers`), update the mirrored numbers in `STINGER_SYNC` /
+`stingerContentMs` in **both** `script.js` files so the windows still match.
+
 Enable it from the overlay's settings page ("Enable Stingers"); this stinger source
 needs no extra flag. The stinger always fades in/out regardless, so it also looks
 fine on its own if the chat isn't set to coordinate.
+
+Both connection handlers log to the console (open the page with `?debug`), e.g.
+`[stinger] Twitch.Sub received → sub stinger, window 3450ms` — handy for confirming
+whether Streamer.bot is actually delivering sub/cheer events.
 
 ### Trigger API
 
