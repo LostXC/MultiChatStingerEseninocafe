@@ -11,9 +11,6 @@ html, body{
 #stage{
   position:fixed; inset:0;
   display:flex; align-items:center; justify-content:center;
-  /* fade in/out for the chat-overlay sync envelope (JS drives opacity).
-     Duration must match STINGER_SYNC.stingerFadeMs in script.js. */
-  transition: opacity 300ms ease;
 }
 
 /* Tip jar (500x650 source) — reposition here for OBS layout */
@@ -21,9 +18,12 @@ html, body{
   max-width:100%; max-height:100%;
 }
 
-/* Frame stingers (sub / donation, 500x600 source) — positioned over the jar via JS */
+/* Frame stingers (sub / donation) — overlaid on the jar. Absolute (NOT fixed) and
+   centered inside #stage so it composites in the same layer as the jar; a fixed
+   canvas can drop out of the render in OBS's browser source. Drawn by the main loop. */
 #stingerCv{
-  position:fixed;
+  position:absolute; inset:0; margin:auto;
+  max-width:100%; max-height:100%;
   pointer-events:none;
   display:none;
 }

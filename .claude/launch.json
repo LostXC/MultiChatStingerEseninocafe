@@ -4,8 +4,8 @@
     {
       "name": "stinger",
       "runtimeExecutable": "python3",
-      "runtimeArgs": ["-m", "http.server", "8737"],
-      "port": 8737
+      "runtimeArgs": ["-m", "http.server", "8738"],
+      "port": 8738
     }
   ]
 }

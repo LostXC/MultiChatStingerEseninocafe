@@ -46,6 +46,7 @@ const CFG = {
   subFrames: 65,
   waitBeforeFadeMs: 800,
   fadeOutMs: 400,
+  subFadeInMs: 250,        // sub/dono stinger eases in instead of popping
 };
 
 const TIP_FILL   = i => `assets/tip-jar-stinger/fill/tip-jar.${pad2(i)}.svg`;
@@ -229,7 +230,7 @@ async function loadAssets(){
    so that vector work is what makes it lag/glitch in OBS even though it's smooth in
    a real browser. Bake every frame/sprite to an offscreen raster canvas once, at the
    size it's actually drawn, so the per-frame draws become cheap bitmap blits. */
-let fillBaked = [], strokeBaked = [], subBaked = [], donoBaked = [];
+let fillBaked = [], strokeBaked = [];
 const gemBaked = new Map();    // source img -> baked canvas
 const noteBaked = new Map();
 function bakeToCanvas(img, w, h){
@@ -240,10 +241,12 @@ function bakeToCanvas(img, w, h){
   return c;
 }
 function bakeAssets(){
+  // Only the CONTINUOUS jar animation is baked (drawn full-canvas 3x + gems, every
+  // frame) — that's the hot path. The sub/donation frames play straight from their
+  // SVGs (a short one-shot, one draw per frame) so we don't keep ~40MB of extra
+  // canvases resident, which can push OBS's browser source into crashing & reloading.
   fillBaked   = fillImgs.map(im => bakeToCanvas(im, W, H));   // full-canvas: exact 1:1 blits
   strokeBaked = strokeImgs.map(im => bakeToCanvas(im, W, H));
-  subBaked    = subImgs.map(im => bakeToCanvas(im, im.width, im.height));
-  donoBaked   = donoImgs.map(im => bakeToCanvas(im, im.width, im.height));
   // gems: bake at the largest on-screen size (a bit's spawn size in flight) so both
   // the smaller settled gems and the larger flying ones stay crisp when scaled.
   const gemPx = Math.ceil(Math.max(GEM, THROW.sizeCenter * MAP.s));
@@ -387,6 +390,7 @@ let playhead=0, playing=true, lastT=null, firstWallFrame=0, introHidden=true;
 let jarState = 'IDLE'; // IDLE, INTRO, PLAYING, OUTRO
 let outroT = 0;
 let lastWallKey = null; // skips rebuilding the static physics walls every frame once settled
+let physicsAcc = 0;     // real-time physics accumulator (keeps gems at correct speed below 60fps)
 let idleTime = 0;
 const LAST = ()=>fillImgs.length-1;
 
@@ -878,6 +882,7 @@ function loop(ts){
     lastT = ts;
     const ctx = $('jarCv').getContext('2d');
     ctx.clearRect(0,0,W,H);
+    renderFramePlayer(performance.now());   // a sub/dono can play over the idle (blank) jar
     requestAnimationFrame(loop);
     return;
   }
@@ -941,10 +946,16 @@ function loop(ts){
     }
   }
 
-  Engine.update(engine, 1000/240);
-  Engine.update(engine, 1000/240);
-  Engine.update(engine, 1000/240);
-  Engine.update(engine, 1000/240);
+  // Real-time fixed-step physics. The old code ran exactly 4 sub-steps per frame,
+  // which advances the simulation a fixed 16.7ms regardless of the real frame time —
+  // so whenever OBS dips below 60fps the gems fall in slow-motion and desync from the
+  // (real-time) bit flights, which reads as "glitchy". Drive the same 240Hz sub-step
+  // off real elapsed time instead: identical to before at 60fps, correct below it.
+  const STEP = 1000/240;
+  physicsAcc += Math.min(dt, 100);              // clamp so a stall can't spiral
+  let pSteps = 0;
+  while(physicsAcc >= STEP && pSteps < 24){ Engine.update(engine, STEP); physicsAcc -= STEP; pSteps++; }
+  if(pSteps >= 24) physicsAcc = 0;              // fell far behind — drop the backlog
 
   // hand flights to physics part-way (pure animation until this moment)
   const now = performance.now();
@@ -1037,14 +1048,21 @@ function loop(ts){
       ctx.stroke();
     }
   }
+  renderFramePlayer(now);   // sub/dono overlay, drawn by this same loop
   requestAnimationFrame(loop);
 }
 
 /* =========================================================================
    Full-screen frame stingers (sub / donation)
+   Driven by the SAME main loop that renders the jar (renderFramePlayer, called
+   every frame from loop()). The old version ran its own requestAnimationFrame on
+   a position:fixed canvas — that combination dropped out of the render in OBS's
+   browser source (the sub never showed there, though it did in a real browser).
+   It fades itself IN and OUT on its real timeline, so nothing else has to time it.
    ========================================================================= */
 const stingerCv = ()=>$('stingerCv');
-let stingerBusy = false;
+let stingerBusy = false;         // a sub/dono sequence is on screen
+let framePlay = null;            // { imgs, type, t0 }
 
 function playFrames(imgs, type){
   if(!imgs.length || stingerBusy) return;
@@ -1052,66 +1070,43 @@ function playFrames(imgs, type){
   const cv = stingerCv();
   cv.width = imgs[0].width; cv.height = imgs[0].height;
   cv.style.display = 'block';
-  const ctx = cv.getContext('2d');
-  const t0 = performance.now();
-  // safety net: if this play ever gets interrupted (OBS pausing/hiding the source
-  // mid-sequence) so the rAF loop below never reaches isFinished, don't let
-  // stingerBusy stay stuck true forever — that would silently block every future
-  // sub stinger. Clear it well after the sequence should have finished.
-  const maxMs = imgs.length / CFG.fps * 1000 + CFG.waitBeforeFadeMs + CFG.fadeOutMs + 2000;
-  const busyGuard = setTimeout(() => { stingerBusy = false; }, maxMs);
-  (function step(now){
-    const elapsed = now - t0;
-    const totalDuration = imgs.length / CFG.fps * 1000;
-    
-    let alpha = 1;
-    let fi = Math.floor(elapsed/1000*CFG.fps);
-    let isFinished = false;
-    
-    if (elapsed < totalDuration) {
-      // playing
-    } else {
-      fi = imgs.length - 1; // hold last frame
-      const postAnimElapsed = elapsed - totalDuration;
-      
-      if (postAnimElapsed < CFG.waitBeforeFadeMs) {
-        // waiting
-      } else {
-        const fadeOutElapsed = postAnimElapsed - CFG.waitBeforeFadeMs;
-        if (fadeOutElapsed < CFG.fadeOutMs) {
-          alpha = 1 - (fadeOutElapsed / CFG.fadeOutMs);
-        } else {
-          alpha = 0;
-          isFinished = true;
-        }
-      }
-    }
-    
-    if (type === 'dono' && elapsed < 500) {
-      alpha = Math.min(alpha, elapsed / 500);
-    }
-    
-    if (isFinished) {
-      cv.style.display = 'none';
-      stingerBusy = false;
-      clearTimeout(busyGuard);
-      return;
-    }
-    
-    ctx.clearRect(0,0,cv.width,cv.height);
-    ctx.globalAlpha = alpha;
-    ctx.drawImage(imgs[fi], 0, 0);
-    ctx.globalAlpha = 1;
-    requestAnimationFrame(step);
-  })(t0);
+  framePlay = { imgs, type, t0: performance.now() };
 }
-function playSub(){ playFrames(subBaked.length ? subBaked : subImgs, 'sub'); }
+function playSub(){ playFrames(subImgs, 'sub'); }
 function playDonation(){
   if(!donoImgs.length){
     console.warn('[stinger] donation-stinger frames not found — add assets/donation-stinger/donation-stinger.00.svg …');
     return;
   }
-  playFrames(donoBaked.length ? donoBaked : donoImgs, 'dono');
+  playFrames(donoImgs, 'dono');
+}
+
+// Advance + draw the active sub/dono frame. Called once per frame by loop().
+function renderFramePlayer(now){
+  if(!framePlay) return;
+  const { imgs, t0 } = framePlay;
+  const cv = stingerCv(), ctx = cv.getContext('2d');
+  const elapsed = now - t0;
+  const totalDuration = imgs.length / CFG.fps * 1000;
+
+  let alpha = 1, fi = Math.floor(elapsed/1000*CFG.fps), isFinished = false;
+  if (elapsed >= totalDuration) {
+    fi = imgs.length - 1;                       // hold the last frame
+    const post = elapsed - totalDuration;
+    if (post >= CFG.waitBeforeFadeMs) {
+      const fo = post - CFG.waitBeforeFadeMs;
+      if (fo < CFG.fadeOutMs) alpha = 1 - fo/CFG.fadeOutMs;   // real outro fade
+      else { alpha = 0; isFinished = true; }
+    }
+  }
+  if (elapsed < CFG.subFadeInMs) alpha = Math.min(alpha, elapsed / CFG.subFadeInMs);  // ease in
+
+  if (isFinished) { ctx.clearRect(0,0,cv.width,cv.height); cv.style.display = 'none'; framePlay = null; stingerBusy = false; return; }
+
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.globalAlpha = alpha;
+  ctx.drawImage(imgs[fi], 0, 0);
+  ctx.globalAlpha = 1;
 }
 
 /* =========================================================================
@@ -1129,47 +1124,38 @@ window.stinger = {
 };
 
 /* =========================================================================
-   Chat-overlay sync envelope
+   Chat-overlay sync
    -------------------------------------------------------------------------
    The chat overlay (MultichatOverlayEseninocafe) and this stinger are two
    SEPARATE OBS browser sources layered over each other. OBS isolates browser
    sources (no shared localStorage / BroadcastChannel), so they can't talk to
-   each other directly. Instead they BOTH subscribe to the same Streamer.bot
-   events and run their halves of ONE shared, fixed timeline — because both
-   sources receive the same event at the same instant, they stay in lockstep
-   with zero cross-source messaging.
+   each other directly — instead they BOTH subscribe to the same Streamer.bot
+   events and react on their own.
 
-   Timeline for a triggering event (t = 0 at event receipt), all values shared:
-     0 .............. chat starts fading out (overlay)          [chatFadeMs]
-     chatFadeMs ..... chat fully hidden; stinger fades in + plays
-     chatFadeMs+contentMs ...... stinger fades out              [stingerFadeMs]
-                                 chat starts fading back in     [chatFadeMs]
-     => stinger leaves as the chat returns; then the overlay renders its card.
+   This source drives NO fixed timing: the jar and the sub each fade themselves in
+   and out on their real completion (the jar via its own intro/outro, the sub via
+   renderFramePlayer). All triggerStinger does is hold the effect back by chatFadeMs
+   so the chat has faded out first. Because there is no forced duration here, the
+   jar can never "false fade" mid-throw.
 
-   contentMs is NOT fixed — it's computed per event by stingerContentMs() so the
-   chat stays hidden exactly as long as the stinger actually needs: a sub is its
-   frame-sequence length; a cheer depends on how many gems get thrown (which the
-   bit amount decides). Both projects compute it from the same event data, so
-   they agree without talking to each other.
-
-   IMPORTANT: STINGER_SYNC and stingerContentMs/stingerCheerThrows must stay
-   identical to the copies in the overlay's script.js (search "STINGER_SYNC").
-   If you change these, change both.
+   stingerContentMs() only *predicts* how long a stinger will run, so the overlay
+   knows roughly when to fade its chat back in. It must stay identical to the copy
+   in the overlay's script.js. It errs slightly long; and since this stinger is
+   layered on top, a small mismatch is hidden behind it anyway.
    ========================================================================= */
 const STINGER_SYNC = {
-  chatFadeMs:    350,   // overlay chat fade out / in (this source only waits it out)
-  stingerFadeMs: 300,   // this source's own fade in and fade out (see #stage transition in style.css)
-  // --- tip-jar timing model (mirrors CFG in this file) so the cheer window can be
-  //     predicted from the bit amount. Keep in step with CFG if you retune it. ---
+  chatFadeMs:     350,  // how long the overlay's chat fade takes (we just wait it out)
+  // --- tip-jar timing model (mirrors CFG in this file) so the overlay can predict
+  //     a cheer's length from the bit amount. Keep in step with CFG if you retune. ---
   fps:            25,   // CFG.fps
   jarIntroFrames: 36,   // collision.frames.length — the jar-rise intro
   throwStaggerMs: 170,  // CFG.throwStaggerMs — gap between queued throws
   throwFlightMs:  780,  // CFG.throwDurationMs — a gem's flight time
+  noteTailMs:     850,  // CFG.noteDurationMs — the last note lingers after the last landing
+  jarIdleMs:      800,  // CFG.waitBeforeFadeMs — idle the jar/sub holds before it fades out
   maxThrows:      40,   // CFG.maxQueuedThrows — the jar clamps a cheer to this many
-  cheerTailMs:    900,  // settle + hold the full jar after the last gem, before fading
   subFrames:      65,   // sub-stinger frame count (subImgs.length)
-  subHoldMs:      550,  // hold the last sub frame before fading
-  bufferMs:       300,  // safety pad so the chat never fades in before the stinger is done
+  marginMs:       250,  // small pad so the chat's card lands as the stinger clears, not before
 };
 
 // How many gems a cheer throws — mirrors CFG.bitTiers decomposition (biggest tier
@@ -1182,55 +1168,31 @@ function stingerCheerThrows(bits){
   return Math.min(n, STINGER_SYNC.maxThrows);
 }
 
-// On-screen time (ms) the stinger needs for an event. Shared by BOTH projects.
+// Predicted on-screen time (ms), from the effect firing to it starting to fade out.
+// Shared verbatim with the overlay so its chat returns as the stinger clears.
 function stingerContentMs(kind, data){
   const S = STINGER_SYNC;
   if(kind === 'cheer'){
     const n = stingerCheerThrows(data && data.bits);
-    const introMs  = S.jarIntroFrames / S.fps * 1000;        // jar rises
-    const throwsMs = (n - 1) * S.throwStaggerMs + S.throwFlightMs; // launch all + last flight
-    return Math.round(introMs + throwsMs + S.cheerTailMs + S.bufferMs);
+    const introMs  = S.jarIntroFrames / S.fps * 1000;                  // jar rises
+    const throwsMs = (n - 1) * S.throwStaggerMs + S.throwFlightMs;      // launch all + last flight
+    return Math.round(introMs + throwsMs + S.noteTailMs + S.jarIdleMs + S.marginMs);
   }
-  // sub / resub / gift / bomb — fixed frame sequence
-  return Math.round(S.subFrames / S.fps * 1000 + S.subHoldMs + S.bufferMs);
+  // sub / resub / gift / bomb — frames play, then hold jarIdleMs, then fade
+  return Math.round(S.subFrames / S.fps * 1000 + S.jarIdleMs + S.marginMs);
 }
 
-const stageEl = $('stage');
-let   stagePending = [];   // effects waiting for the current cycle's fade-in moment
-let   stageFadeInAt = 0;   // performance.now() timestamp of this cycle's fade-in
-let   stageCycleEndAt = 0; // performance.now() timestamp the stage is fully hidden again
-function stageFade(op){ if(stageEl) stageEl.style.opacity = String(op); }
-
-function startStageCycle(contentMs){
-  const S = STINGER_SYNC, now = performance.now();
-  stageFadeInAt   = now + S.chatFadeMs;
-  stageCycleEndAt = now + S.chatFadeMs + contentMs + S.stingerFadeMs;
-  stageFade(0);                                             // hide (canvas is blank here anyway)
-  setTimeout(()=>{                                          // chat is gone -> fade in + fire queued effects
-    stageFade(1);
-    const items = stagePending; stagePending = [];
-    items.forEach(e => e.effect());
-  }, S.chatFadeMs);
-  setTimeout(()=> stageFade(0), S.chatFadeMs + contentMs);  // fade out as content ends
-  // once fully hidden (and no fresh cycle superseded us) restore to visible so the
-  // blank idle stage and any manual HUD trigger show again
-  setTimeout(()=>{ if(performance.now() >= stageCycleEndAt) stageFade(1); },
-             S.chatFadeMs + contentMs + S.stingerFadeMs + 400);
-}
-
-// Route a Streamer.bot event through the sync envelope. kind is 'cheer' or 'sub'.
-function triggerStinger(kind, data, effect){
-  const now = performance.now();
-  if(now >= stageCycleEndAt) startStageCycle(stingerContentMs(kind, data)); // no cycle -> start one
-  if(now < stageFadeInAt){
-    // still before this cycle's fade-in: queue the effect to fire then. Collapse a
-    // burst of gift-subs (a sub bomb) into a single sub stinger.
-    if(kind === 'sub' && stagePending.some(e => e.kind === 'sub')) return;
-    stagePending.push({ kind, effect });
+// Route a Streamer.bot event to the stinger. The jar/sub own their own fades, so we
+// only delay the trigger by chatFadeMs (let the chat fade out first) and collapse a
+// gift-sub bomb into a single sub.
+let subQueued = false;
+function triggerStinger(kind, effect){
+  if(kind === 'sub'){
+    if(subQueued || stingerBusy) return;                                // one sub at a time
+    subQueued = true;
+    setTimeout(() => { subQueued = false; effect(); }, STINGER_SYNC.chatFadeMs);
   } else {
-    // stinger already on screen: fire now (cheer adds to the jar; a duplicate sub is
-    // harmlessly ignored by playFrames' stingerBusy guard)
-    effect();
+    setTimeout(effect, STINGER_SYNC.chatFadeMs);                        // the jar queues multiple cheers itself
   }
 }
 
@@ -1271,23 +1233,21 @@ function connectStreamerbot(){
     onDisconnect: () => console.log('[stinger] disconnected from Streamer.bot — retrying…'),
   });
 
-  // Cheer -> tiered bit gems in the tip jar (through the chat-sync envelope)
+  // Cheer -> tiered bit gems in the tip jar (delayed so the chat fades out first)
   if(showCheers){
     client.on('Twitch.Cheer', ({ data }) => {
       const bits = Number(data?.bits ?? data?.message?.bits ?? 0);
-      console.log('[stinger] Twitch.Cheer received — bits:', bits,
-                  '→ window', stingerContentMs('cheer', { bits }) + 'ms');
-      if(bits > 0) triggerStinger('cheer', { bits }, () => stinger.cheer(bits));
+      console.log('[stinger] Twitch.Cheer received — bits:', bits);
+      if(bits > 0) triggerStinger('cheer', () => stinger.cheer(bits));
     });
   }
 
   // Sub / Resub / Gift sub -> full-screen sub stinger (donation stinger untouched).
   // A gift-sub bomb fires many GiftSub events; triggerStinger collapses them into one.
   if(showSubs){
-    const onSub = (name) => (evt) => {
-      console.log('[stinger] ' + name + ' received → sub stinger, window',
-                  stingerContentMs('sub') + 'ms');
-      triggerStinger('sub', evt && evt.data, () => stinger.playSub());
+    const onSub = (name) => () => {
+      console.log('[stinger] ' + name + ' received → sub stinger');
+      triggerStinger('sub', () => stinger.playSub());
     };
     client.on('Twitch.Sub',     onSub('Twitch.Sub'));
     client.on('Twitch.ReSub',   onSub('Twitch.ReSub'));
@@ -1325,9 +1285,14 @@ function wireHud(){
 
 (async ()=>{
   const params = new URLSearchParams(location.search);
+  // Only surface the "loading assets…" note while debugging — on stream it must stay
+  // invisible (OBS reloads the source on scene changes, and a routine loader flashing
+  // each time looks broken). A hard asset error still shows so it isn't a silent blank.
+  if(params.has('debug')) $('loading').hidden = false;
   try{
     await loadAssets();
   }catch(err){
+    $('loading').hidden = false;
     $('loading').textContent = 'asset error: ' + err.message;
     return;
   }
